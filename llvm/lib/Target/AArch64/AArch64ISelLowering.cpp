@@ -2198,7 +2198,9 @@ MachineBasicBlock *AArch64TargetLowering::EmitInstrWithCustomInserter(
 
   case TargetOpcode::STACKMAP:
   case TargetOpcode::PATCHPOINT:
+    return emitPatchPoint(MI, BB);
   case TargetOpcode::STATEPOINT:
+    MI.addOperand(*BB->getParent(), MachineOperand::CreateReg(AArch64::LR, true, true));
     return emitPatchPoint(MI, BB);
 
   case AArch64::CATCHRET:

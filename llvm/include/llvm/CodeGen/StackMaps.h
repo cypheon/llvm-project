@@ -171,7 +171,7 @@ class StatepointOpers {
 
 public:
   explicit StatepointOpers(const MachineInstr *MI) : MI(MI) {
-    NumDefs = MI->getNumDefs();
+    NumDefs = MI->getNumExplicitDefs();
   }
 
   /// Get index of statepoint ID operand.
