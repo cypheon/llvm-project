@@ -2184,6 +2184,10 @@ MachineBasicBlock *AArch64TargetLowering::EmitLoweredCatchRet(
   return BB;
 }
 
+static const MCPhysReg ImplicitDefLR[] = { AArch64::LR, 0 };
+MCInstrDesc CLONED_STATEPOINT_MCID =
+  { TargetOpcode::STATEPOINT,	0,	0,	0,	0,	0|(1ULL<<MCID::Pseudo)|(1ULL<<MCID::Call)|(1ULL<<MCID::MayLoad)|(1ULL<<MCID::MayStore)|(1ULL<<MCID::UsesCustomInserter)|(1ULL<<MCID::Variadic)|(1ULL<<MCID::UnmodeledSideEffects), 0x0ULL, nullptr, ImplicitDefLR, nullptr };  // Inst #30 = STATEPOINT
+
 MachineBasicBlock *AArch64TargetLowering::EmitInstrWithCustomInserter(
     MachineInstr &MI, MachineBasicBlock *BB) const {
   switch (MI.getOpcode()) {
@@ -2198,7 +2202,9 @@ MachineBasicBlock *AArch64TargetLowering::EmitInstrWithCustomInserter(
 
   case TargetOpcode::STACKMAP:
   case TargetOpcode::PATCHPOINT:
+    return emitPatchPoint(MI, BB);
   case TargetOpcode::STATEPOINT:
+    MI.setDesc(CLONED_STATEPOINT_MCID);
     return emitPatchPoint(MI, BB);
 
   case AArch64::CATCHRET:
