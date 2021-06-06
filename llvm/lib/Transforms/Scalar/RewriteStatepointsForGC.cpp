@@ -2961,9 +2961,7 @@ static void computeLiveInValues(BasicBlock::reverse_iterator Begin,
 
     // USE - Add to the LiveIn set for this instruction
     for (Value *V : I.operands()) {
-      assert(!isUnhandledGCPointerType(V->getType()) &&
-             "support for FCA unimplemented");
-      if (isHandledGCPointerType(V->getType()) && !isa<Constant>(V)) {
+      if (containsGCPtrType(V->getType()) && !isa<Constant>(V)) {
         // The choice to exclude all things constant here is slightly subtle.
         // There are two independent reasons:
         // - We assume that things which are constant (from LLVM's definition)
