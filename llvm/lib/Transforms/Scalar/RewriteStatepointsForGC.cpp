@@ -335,7 +335,6 @@ static bool isHandledGCPointerType(Type *T) {
   return false;
 }
 
-#ifndef NDEBUG
 /// Returns true if this type contains a gc pointer whether we know how to
 /// handle that type or not.
 static bool containsGCPtrType(Type *Ty) {
@@ -350,6 +349,7 @@ static bool containsGCPtrType(Type *Ty) {
   return false;
 }
 
+#ifndef NDEBUG
 // Returns true if this is a type which a) is a gc pointer or contains a GC
 // pointer and b) is of a type which the code doesn't expect (i.e. first class
 // aggregates).  Used to trip assertions.
@@ -1252,6 +1252,8 @@ findBasePointers(const StatepointLiveSetTy &live,
                  MapVector<Value *, Value *> &PointerToBase,
                  DominatorTree *DT, DefiningValueMapTy &DVCache) {
   for (Value *ptr : live) {
+    if (!isHandledGCPointerType(ptr->getType()))
+      continue;
     Value *base = findBasePointer(ptr, DVCache);
     assert(base && "failed to find base pointer");
     PointerToBase[ptr] = base;
@@ -1407,6 +1409,13 @@ static void CreateGCRelocates(ArrayRef<Value *> LiveVariables,
   };
   Module *M = StatepointToken->getModule();
 
+  dbgs() << "CreateGCRelocates()\n";
+
+  if (PrintLiveSet) {
+    dbgs() << "Live Variables:\n";
+    for (Value *V : LiveVariables)
+      dbgs() << " " << V->getName() << " " << *V << "\n";
+  }
   // All gc_relocate are generated as i8 addrspace(1)* (or a vector type whose
   // element type is i8 addrspace(1)*). We originally generated unique
   // declarations for each pointer type, but this proved problematic because
@@ -1415,6 +1424,7 @@ static void CreateGCRelocates(ArrayRef<Value *> LiveVariables,
   // to an i8* of the right address space.  A bitcast is added later to convert
   // gc_relocate to the actual value's type.
   auto getGCRelocateDecl = [&] (Type *Ty) {
+    dbgs() << "getGCRelocateDecl: " << *Ty << "\n";
     assert(isHandledGCPointerType(Ty));
     auto AS = Ty->getScalarType()->getPointerAddressSpace();
     Type *NewTy = Type::getInt8PtrTy(M->getContext(), AS);
@@ -1455,6 +1465,7 @@ namespace {
 /// This struct is used to defer RAUWs and `eraseFromParent` s.  Using this
 /// avoids having to worry about keeping around dangling pointers to Values.
 class DeferredReplacement {
+  public:
   AssertingVH<Instruction> Old;
   AssertingVH<Instruction> New;
   bool IsDeoptimize = false;
@@ -1495,6 +1506,13 @@ public:
     Instruction *OldI = Old;
     Instruction *NewI = New;
 
+    dbgs() << "replace: " << *OldI << "\n";
+    if (NewI) {
+      dbgs() << "   with: " << *NewI << "\n";
+    } else {
+      dbgs() << "   with: null\n";
+    }
+
     assert(OldI != NewI && "Disallowed at construction?!");
     assert((!IsDeoptimize || !New) &&
            "Deoptimize intrinsics are not replaced!");
@@ -1513,7 +1531,9 @@ public:
       RI->eraseFromParent();
     }
 
+    dbgs() << "REMOVE SKIPPED\n";
     OldI->eraseFromParent();
+    //OldI->removeFromParent();
   }
 };
 
@@ -1826,6 +1846,9 @@ makeStatepointExplicit(DominatorTree &DT, CallBase *Call,
   const auto &LiveSet = Result.LiveSet;
   const auto &PointerToBase = Result.PointerToBase;
 
+  dbgs() << "make explicit START: " << *Call << "\n";
+  dbgs() << "============================================================================\n";
+
   // Convert to vector for efficient cross referencing.
   SmallVector<Value *, 64> BaseVec, LiveVec;
   LiveVec.reserve(LiveSet.size());
@@ -1837,6 +1860,16 @@ makeStatepointExplicit(DominatorTree &DT, CallBase *Call,
     BaseVec.push_back(Base);
   }
   assert(LiveVec.size() == BaseVec.size());
+  if (PrintLiveSet) {
+    dbgs() << "Live Variables before make explicit:\n";
+    for (Value *V : LiveVec)
+      dbgs() << " " << V->getName() << " " << *V << "\n";
+  }
+  if (PrintLiveSet) {
+    dbgs() << "Base Variables before make explicit:\n";
+    for (Value *V : BaseVec)
+      dbgs() << " " << V->getName() << " " << *V << "\n";
+  }
 
   // Do the actual rewriting and delete the old statepoint
   makeStatepointExplicitImpl(Call, BaseVec, LiveVec, Result, Replacements);
@@ -2366,6 +2399,7 @@ static void rematerializeLiveValues(CallBase *Call,
       assert(InsertBefore);
       Instruction *RematerializedValue = rematerializeChain(
           InsertBefore, RootOfChain, Info.PointerToBase[LiveValue]);
+
       Info.RematerializedValues[RematerializedValue] = LiveValue;
     } else {
       auto *Invoke = cast<InvokeInst>(Call);
@@ -2388,6 +2422,92 @@ static void rematerializeLiveValues(CallBase *Call,
   // Remove rematerializaed values from the live set
   for (auto LiveValue: LiveValuesToBeDeleted) {
     Info.LiveSet.remove(LiveValue);
+  }
+}
+
+static void rematerializeAggregateLiveValues(CallBase *Call,
+                                    PartiallyConstructedSafepointRecord &Info,
+                                    TargetTransformInfo &TTI) {
+  // Record values we are going to delete from this statepoint live set.
+  // We can not do this in following loop due to iterator invalidation.
+  SmallVector<Value *, 32> LiveValuesToBeDeleted;
+  SmallVector<Value *, 32> LiveValuesToBeAdded;
+
+  IRBuilder<> BuilderPre(Call);
+  IRBuilder<> BuilderPost(Call);
+
+  dbgs() << "rematAggregates: " << *Call << "\n";
+
+  for (Value *LiveValue: Info.LiveSet) {
+    StructType *ST = dyn_cast<StructType>(LiveValue->getType());
+
+    // Not a struct type
+    if (!ST)
+      continue;
+
+    // Remove value from the live set
+    LiveValuesToBeDeleted.push_back(LiveValue);
+
+    // Utility function which destructures the struct value
+    // and re-assembles it after the statepoint
+    //auto rematerializeStruct = [&Call](
+    //    Instruction *InsertBefore, Value *RootOfChain, Value *AlternateLiveBase) {
+    //};
+
+    // TODO: how to handle invokes?
+    assert(isa<CallInst>(Call));
+    BuilderPre.SetInsertPoint(Call);
+
+    Instruction *InsertBefore = Call->getNextNode();
+    assert(InsertBefore);
+    BuilderPost.SetInsertPoint(InsertBefore);
+
+    int i = 0;
+    Value *reassembledValue = UndefValue::get(ST);
+    auto extractedElementName = suffixed_name_or(LiveValue, ".ex", "ex");
+    auto reassembledName = suffixed_name_or(LiveValue, ".re", "re");
+    for (Type *elemTy : ST->elements()) {
+      dbgs() << "handle struct: " << LiveValue->getName() << " , element index " << i << "\n";
+      dbgs() << "  element type: " << elemTy << "\n";
+
+      Value *extractedElement = BuilderPre.CreateExtractValue(LiveValue, i, extractedElementName);
+      if (isHandledGCPointerType(elemTy)) {
+        LiveValuesToBeAdded.push_back(extractedElement);
+        Info.PointerToBase[extractedElement] = extractedElement;
+      }
+
+      reassembledValue = BuilderPost.CreateInsertValue(reassembledValue, extractedElement, i, reassembledName);
+
+      ++i;
+    }
+    Instruction *finalReassembledValue = dyn_cast<Instruction>(reassembledValue);
+    assert(finalReassembledValue);
+
+    Info.RematerializedValues[finalReassembledValue] = LiveValue;
+    dbgs() << "rematerialized: " << *finalReassembledValue <<
+      " = " << LiveValue->getName() << " " << *LiveValue << "\n\n";
+  }
+
+  if (PrintLiveSet) {
+    dbgs() << "Live Variables before DEL:\n";
+    for (Value *V : Info.LiveSet)
+      dbgs() << " " << V->getName() << " " << *V << "\n";
+  }
+  // Remove rematerializaed values from the live set
+  for (auto LiveValue: LiveValuesToBeDeleted) {
+    dbgs() << "DEL live: " << *LiveValue << "\n";
+    Info.LiveSet.remove(LiveValue);
+  }
+  // Add struct members to the live set
+  for (auto LiveValue: LiveValuesToBeAdded) {
+    dbgs() << "add live: " << *LiveValue << "\n";
+    Info.LiveSet.insert(LiveValue);
+  }
+
+  if (PrintLiveSet) {
+    dbgs() << "Live Variables after ADD:\n";
+    for (Value *V : Info.LiveSet)
+      dbgs() << " " << V->getName() << " " << *V << "\n";
   }
 }
 
@@ -2547,6 +2667,9 @@ static bool insertParsePoints(Function &F, DominatorTree &DT,
     }
   }
 
+  for (size_t i = 0; i < Records.size(); i++)
+    rematerializeAggregateLiveValues(ToUpdate[i], Records[i], TTI);
+
   // It is possible that non-constant live variables have a constant base.  For
   // example, a GEP with a variable offset from a global.  In this case we can
   // remove it from the liveset.  We already don't add constants to the liveset
@@ -2587,8 +2710,21 @@ static bool insertParsePoints(Function &F, DominatorTree &DT,
 
   ToUpdate.clear(); // prevent accident use of invalid calls.
 
-  for (auto &PR : Replacements)
+  for (auto &PR : Replacements) {
+    if (PR.New && PR.Old) {
+      for (auto &Result : Records) {
+        for (auto &RematerializedValuePair: Result.RematerializedValues) {
+          dbgs() << "scan map\n";
+          if (RematerializedValuePair.second == PR.Old) {
+            RematerializedValuePair.second = PR.New;
+            dbgs() << "replaced: " << *PR.Old << " --> " << *PR.New << "\n";
+            //dbgs() << "replaced: " << *Call << " --> " << *GCResult << "\n";
+          }
+        }
+      }
+    }
     PR.doReplacement();
+  }
 
   Replacements.clear();
 
@@ -2988,7 +3124,7 @@ static void computeLiveOutSeed(BasicBlock *BB, SetVector<Value *> &LiveTmp) {
       Value *V = PN->getIncomingValueForBlock(BB);
       assert(!isUnhandledGCPointerType(V->getType()) &&
              "support for FCA unimplemented");
-      if (isHandledGCPointerType(V->getType()) && !isa<Constant>(V))
+      if (containsGCPtrType(V->getType()) && !isa<Constant>(V))
         LiveTmp.insert(V);
     }
   }
@@ -2997,7 +3133,7 @@ static void computeLiveOutSeed(BasicBlock *BB, SetVector<Value *> &LiveTmp) {
 static SetVector<Value *> computeKillSet(BasicBlock *BB) {
   SetVector<Value *> KillSet;
   for (Instruction &I : *BB)
-    if (isHandledGCPointerType(I.getType()))
+    if (containsGCPtrType(I.getType()))
       KillSet.insert(&I);
   return KillSet;
 }
