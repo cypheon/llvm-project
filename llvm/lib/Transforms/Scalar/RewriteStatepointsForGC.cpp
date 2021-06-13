@@ -1457,7 +1457,6 @@ namespace {
 /// This struct is used to defer RAUWs and `eraseFromParent` s.  Using this
 /// avoids having to worry about keeping around dangling pointers to Values.
 class DeferredReplacement {
-  public:
   AssertingVH<Instruction> Old;
   AssertingVH<Instruction> New;
   bool IsDeoptimize = false;
@@ -1491,6 +1490,19 @@ public:
     D.Old = Old;
     D.IsDeoptimize = true;
     return D;
+  }
+
+  // Fixup rematerialization mappings depending on this value
+  void replaceInRematerializedValuesMap(RematerializedValueMapTy &RM) {
+    if (!Old->getType()->isStructTy())
+      return;
+
+    for (auto &RematerializedValuePair: RM) {
+      if (RematerializedValuePair.second == Old) {
+        assert(New);
+        RematerializedValuePair.second = New;
+      }
+    }
   }
 
   /// Does the task represented by this instance.
@@ -2394,7 +2406,7 @@ static void rematerializeLiveValues(CallBase *Call,
   }
 }
 
-// First Class Aggregate value can noot be passed directly to a statepoint, so
+// First Class Aggregate value can not be passed directly to a statepoint, so
 // we take apart all FCAs live at the call site and re-assemble them
 // afterwards.  This way, each individual component can be relocated in the
 // usual way.
@@ -2670,15 +2682,8 @@ static bool insertParsePoints(Function &F, DominatorTree &DT,
   ToUpdate.clear(); // prevent accident use of invalid calls.
 
   for (auto &PR : Replacements) {
-    if (PR.Old->getType()->isStructTy()) {
-      for (auto &Result : Records) {
-        for (auto &RematerializedValuePair: Result.RematerializedValues) {
-          if (RematerializedValuePair.second == PR.Old) {
-            assert(PR.New);
-            RematerializedValuePair.second = PR.New;
-          }
-        }
-      }
+    for (auto &Record : Records) {
+      PR.replaceInRematerializedValuesMap(Record.RematerializedValues);
     }
     PR.doReplacement();
   }
