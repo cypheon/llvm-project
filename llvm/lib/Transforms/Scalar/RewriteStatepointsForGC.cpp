@@ -332,9 +332,12 @@ static bool isHandledGCPointerType(Type *T) {
   if (auto VT = dyn_cast<VectorType>(T))
     if (isGCPointerType(VT->getElementType()))
       return true;
+  if (StructType *ST = dyn_cast<StructType>(T))
+    return llvm::any_of(ST->elements(), isHandledGCPointerType);
   return false;
 }
 
+#ifndef NDEBUG
 /// Returns true if this type contains a gc pointer whether we know how to
 /// handle that type or not.
 static bool containsGCPtrType(Type *Ty) {
@@ -349,7 +352,6 @@ static bool containsGCPtrType(Type *Ty) {
   return false;
 }
 
-#ifndef NDEBUG
 // Returns true if this is a type which a) is a gc pointer or contains a GC
 // pointer and b) is of a type which the code doesn't expect (i.e. first class
 // aggregates).  Used to trip assertions.
@@ -1252,7 +1254,8 @@ findBasePointers(const StatepointLiveSetTy &live,
                  MapVector<Value *, Value *> &PointerToBase,
                  DominatorTree *DT, DefiningValueMapTy &DVCache) {
   for (Value *ptr : live) {
-    if (!isHandledGCPointerType(ptr->getType()))
+    // FCAs don't have a base pointer.  They will be split and reassembled.
+    if (isa<StructType>(ptr->getType()))
       continue;
     Value *base = findBasePointer(ptr, DVCache);
     assert(base && "failed to find base pointer");
@@ -3059,7 +3062,7 @@ static void computeLiveInValues(BasicBlock::reverse_iterator Begin,
 
     // USE - Add to the LiveIn set for this instruction
     for (Value *V : I.operands()) {
-      if (containsGCPtrType(V->getType()) && !isa<Constant>(V)) {
+      if (isHandledGCPointerType(V->getType()) && !isa<Constant>(V)) {
         // The choice to exclude all things constant here is slightly subtle.
         // There are two independent reasons:
         // - We assume that things which are constant (from LLVM's definition)
@@ -3086,7 +3089,7 @@ static void computeLiveOutSeed(BasicBlock *BB, SetVector<Value *> &LiveTmp) {
       Value *V = PN->getIncomingValueForBlock(BB);
       assert(!isUnhandledGCPointerType(V->getType()) &&
              "support for FCA unimplemented");
-      if (containsGCPtrType(V->getType()) && !isa<Constant>(V))
+      if (isHandledGCPointerType(V->getType()) && !isa<Constant>(V))
         LiveTmp.insert(V);
     }
   }
@@ -3095,7 +3098,7 @@ static void computeLiveOutSeed(BasicBlock *BB, SetVector<Value *> &LiveTmp) {
 static SetVector<Value *> computeKillSet(BasicBlock *BB) {
   SetVector<Value *> KillSet;
   for (Instruction &I : *BB)
-    if (containsGCPtrType(I.getType()))
+    if (isHandledGCPointerType(I.getType()))
       KillSet.insert(&I);
   return KillSet;
 }

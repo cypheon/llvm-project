@@ -25,3 +25,57 @@ define %R1 @f0(i32) gc "statepoint-example" {
 
   ret %R1 %val
 }
+
+define private fastcc %R1 @branching() gc "statepoint-example" {
+; CHECK-LABEL: @branching(
+; CHECK-NEXT:  glbl_e199:
+; CHECK-NEXT:    br i1 undef, label [[GLBL_T320:%.*]], label [[GLBL_F322:%.*]]
+; CHECK:       glbl_t320:
+; CHECK-NEXT:    br label [[GLBL_TE321:%.*]]
+; CHECK:       glbl_te321:
+; CHECK-NEXT:    br label [[GLBL_E324:%.*]]
+; CHECK:       glbl_f322:
+; CHECK-NEXT:    br label [[GLBL_T382:%.*]]
+; CHECK:       glbl_t382:
+; CHECK-NEXT:    br label [[GLBL_TE383:%.*]]
+; CHECK:       glbl_te383:
+; CHECK-NEXT:    br label [[GLBL_E386:%.*]]
+; CHECK:       glbl_e386:
+; CHECK-NEXT:    [[STATEPOINT_TOKEN:%.*]] = call fastcc token (i64, i32, [[R1:%.*]] (i32)*, i32, i32, ...) @llvm.experimental.gc.statepoint.p0f_s_R1si32f(i64 2882400000, i32 0, [[R1]] (i32)* @extfun1, i32 1, i32 0, i32 16, i32 0, i32 0)
+; CHECK-NEXT:    [[T4121:%.*]] = call [[R1]] @llvm.experimental.gc.result.s_R1s(token [[STATEPOINT_TOKEN]])
+; CHECK-NEXT:    br label [[GLBL_FE323:%.*]]
+; CHECK:       glbl_fe323:
+; CHECK-NEXT:    br label [[GLBL_E324]]
+; CHECK:       glbl_e324:
+; CHECK-NEXT:    [[T222_PN:%.*]] = phi [[R1]] [ undef, [[GLBL_TE321]] ], [ [[T4121]], [[GLBL_FE323]] ]
+; CHECK-NEXT:    ret [[R1]] undef
+;
+glbl_e199:
+  br i1 undef, label %glbl_t320, label %glbl_f322
+
+glbl_t320:                                        ; preds = %glbl_e199
+  br label %glbl_te321
+
+glbl_te321:                                       ; preds = %glbl_t320
+  br label %glbl_e324
+
+glbl_f322:                                        ; preds = %glbl_e199
+  br label %glbl_t382
+
+glbl_t382:                                        ; preds = %glbl_f322
+  br label %glbl_te383
+
+glbl_te383:                                       ; preds = %glbl_t382
+  br label %glbl_e386
+
+glbl_e386:                                        ; preds = %glbl_te383
+  %t412 = call fastcc %R1 @extfun1(i32 16)
+  br label %glbl_fe323
+
+glbl_fe323:                                       ; preds = %glbl_e386
+  br label %glbl_e324
+
+glbl_e324:                                        ; preds = %glbl_fe323, %glbl_te321
+  %t222.pn = phi %R1 [ undef, %glbl_te321 ], [ %t412, %glbl_fe323 ]
+  ret %R1 undef
+}
